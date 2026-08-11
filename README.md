@@ -11,7 +11,6 @@ BTC o ETH. No ejecuta órdenes. No es consejo financiero.
 1. Abrí Telegram y buscá **@BotFather**.
 2. Enviale `/newbot` y seguí las instrucciones (nombre, username terminado en `bot`).
 3. BotFather te va a dar un **token** con esta pinta:
-   `123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
    Guardalo, es tu `TELEGRAM_BOT_TOKEN`.
 
 ## Paso 2 — Conseguir tu Chat ID
