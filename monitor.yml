@@ -1,0 +1,42 @@
+name: Crypto Signal Monitor
+
+on:
+  schedule:
+    # Corre cada 15 minutos. Ajustá el cron si querés otra frecuencia.
+    # Sintaxis: minuto hora dia mes dia-semana (siempre en UTC)
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}   # permite tirarlo a mano desde la pestaña "Actions" de GitHub
+
+jobs:
+  check-signals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state (evita alertas repetidas)
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: crypto-monitor-state
+          restore-keys: crypto-monitor-state
+
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INTERVAL: '1h'
+          RSI_PERIOD: '14'
+          MA_FAST: '9'
+          MA_SLOW: '21'
+          RSI_LOW: '30'
+          RSI_HIGH: '70'
+        run: python crypto_monitor.py
