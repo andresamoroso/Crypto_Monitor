@@ -3,21 +3,11 @@
 Crypto Signal Monitor — watch-only alert bot
 ----------------------------------------------
 Monitorea BTC y ETH en Binance, calcula RSI, cruce de medias móviles y
-momentum, y manda una alerta por Telegram cuando 2+ señales se alinean.
+momentum sobre velas CERRADAS (evita repintado), y manda una alerta por
+Telegram cuando 2+ señales se alinean, con volumen y tendencia mayor
+como filtros obligatorios.
 
 NO ejecuta órdenes. NO es consejo financiero. Solo vigila y avisa.
-
-Config vía variables de entorno (con defaults razonables):
-  TELEGRAM_BOT_TOKEN   (requerido)
-  TELEGRAM_CHAT_ID     (requerido)
-  SYMBOLS              default "BTCUSDT,ETHUSDT"
-  INTERVAL             default "1h"   (15m, 1h, 4h, 1d — timeframes de Binance)
-  RSI_PERIOD           default 14
-  MA_FAST              default 9
-  MA_SLOW              default 21
-  RSI_LOW              default 30
-  RSI_HIGH             default 70
-  STATE_FILE           default "state.json"
 """
 
 import os
@@ -25,11 +15,10 @@ import json
 import sys
 import requests
 
-# ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SYMBOLS = os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
-INTERVAL = os.environ.get("INTERVAL", "1h")
+INTERVAL = os.environ.get("INTERVAL", "15m")
 RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
 MA_FAST = int(os.environ.get("MA_FAST", 9))
 MA_SLOW = int(os.environ.get("MA_SLOW", 21))
@@ -38,36 +27,39 @@ RSI_HIGH = float(os.environ.get("RSI_HIGH", 70))
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 KLINES_LIMIT = 150
 
+HTF_INTERVAL = os.environ.get("HTF_INTERVAL", "4h")
+HTF_SMA_PERIOD = int(os.environ.get("HTF_SMA_PERIOD", 50))
+REQUIRE_VOLUME = os.environ.get("REQUIRE_VOLUME", "true").lower() == "true"
+REQUIRE_HTF_TREND = os.environ.get("REQUIRE_HTF_TREND", "true").lower() == "true"
+
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
-# ---------- Data ----------
 def fetch_klines(symbol, interval, limit=KLINES_LIMIT):
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    params = {"symbol": symbol, "interval": interval, "limit": limit + 1}
     r = requests.get(BINANCE_URL, params=params, timeout=15)
     r.raise_for_status()
     raw = r.json()
-    return [
+    candles = [
         {
-            "time": k[0],
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
+            "time": k[0], "open": float(k[1]), "high": float(k[2]),
+            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+            "is_closed": True,
         }
         for k in raw
     ]
+    if candles:
+        candles[-1]["is_closed"] = False
+    return candles
 
 
-# ---------- Indicators ----------
 def sma(values, period):
     out = [None] * len(values)
     for i in range(len(values)):
         if i < period - 1:
             continue
-        out[i] = sum(values[i - period + 1 : i + 1]) / period
+        out[i] = sum(values[i - period + 1: i + 1]) / period
     return out
 
 
@@ -127,10 +119,44 @@ def momentum(closes, lookback):
     return ((now - past) / past) * 100
 
 
-# ---------- Signal evaluation ----------
-def evaluate(symbol, candles):
-    closes = [c["close"] for c in candles]
+def higher_timeframe_trend(symbol):
+    try:
+        candles = fetch_klines(symbol, HTF_INTERVAL, limit=HTF_SMA_PERIOD + 5)
+    except Exception as e:
+        print(f"[WARN] {symbol}: no se pudo obtener tendencia {HTF_INTERVAL} ({e})")
+        return None
+    closed = [c for c in candles if c["is_closed"]]
+    closes = [c["close"] for c in closed]
+    if len(closes) < HTF_SMA_PERIOD:
+        return None
+    ma = sma(closes, HTF_SMA_PERIOD)
+    ma_now = last_valid(ma)
+    if ma_now is None:
+        return None
     last_close = closes[-1]
+    if last_close > ma_now:
+        return "bull"
+    if last_close < ma_now:
+        return "bear"
+    return None
+
+
+def volume_confirmation(volumes, lookback=20, multiplier=1.2):
+    if len(volumes) < lookback + 1:
+        return False, 0.0
+    recent = volumes[-1]
+    avg = sum(volumes[-(lookback + 1):-1]) / lookback
+    if avg == 0:
+        return False, 0.0
+    ratio = recent / avg
+    return ratio >= multiplier, ratio
+
+
+def evaluate(symbol, candles):
+    live_price = candles[-1]["close"]
+    closed = [c for c in candles if c["is_closed"]]
+    closes = [c["close"] for c in closed]
+    volumes = [c["volume"] for c in closed]
 
     rsi_arr = rsi(closes, RSI_PERIOD)
     rsi_now = last_valid(rsi_arr)
@@ -138,6 +164,7 @@ def evaluate(symbol, candles):
     slow_arr = sma(closes, MA_SLOW)
     cross = cross_state(fast_arr, slow_arr)
     mom = momentum(closes, min(10, len(closes) - 1))
+    vol_confirmed, vol_ratio = volume_confirmation(volumes)
 
     rsi_kind = "neutral"
     if rsi_now is not None:
@@ -161,23 +188,47 @@ def evaluate(symbol, candles):
     bull = [rsi_kind, cross_kind, mom_kind].count("bull")
     bear = [rsi_kind, cross_kind, mom_kind].count("bear")
 
-    direction = None
+    base_direction = None
     if bull >= 2:
-        direction = "bull"
+        base_direction = "bull"
     elif bear >= 2:
-        direction = "bear"
+        base_direction = "bear"
+
+    last_candle = closed[-1] if closed else None
+    candle_direction = None
+    if last_candle:
+        if last_candle["close"] > last_candle["open"]:
+            candle_direction = "bull"
+        elif last_candle["close"] < last_candle["open"]:
+            candle_direction = "bear"
+
+    htf_trend = higher_timeframe_trend(symbol)
+
+    direction = base_direction
+    gate_reasons = []
+
+    if direction and REQUIRE_VOLUME:
+        volume_ok = vol_confirmed and candle_direction == direction
+        if not volume_ok:
+            gate_reasons.append("volumen no confirma")
+            direction = None
+
+    if direction and REQUIRE_HTF_TREND:
+        if htf_trend is None or htf_trend != base_direction:
+            gate_reasons.append(f"tendencia {HTF_INTERVAL} no alineada")
+            direction = None
 
     return {
-        "symbol": symbol,
-        "price": last_close,
-        "rsi": rsi_now,
-        "cross": cross,
-        "momentum": mom,
-        "direction": direction,
+        "symbol": symbol, "price": live_price,
+        "closed_close": closes[-1] if closes else live_price,
+        "rsi": rsi_now, "cross": cross, "momentum": mom,
+        "volume_confirmed": vol_confirmed, "volume_ratio": vol_ratio,
+        "base_direction": base_direction, "htf_trend": htf_trend,
+        "direction": direction, "blocked_by": gate_reasons,
+        "last_closed_candle_time": closed[-1]["time"] if closed else None,
     }
 
 
-# ---------- Telegram ----------
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[WARN] Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID — no se envía alerta.")
@@ -196,18 +247,20 @@ def format_alert(result):
     tag = "posible rebote (señales alcistas alineadas)" if result["direction"] == "bull" \
         else "posible agotamiento (señales bajistas alineadas)"
     rsi_txt = f"{result['rsi']:.1f}" if result["rsi"] is not None else "—"
+    vol_txt = f"{result['volume_ratio']:.2f}x" + (" ✅ confirma" if result["volume_confirmed"] else " (débil)")
     return (
         f"{icon} *{label}* — {tag}\n"
         f"Precio: ${result['price']:,.2f}\n"
         f"RSI({RSI_PERIOD}): {rsi_txt}\n"
         f"Medias {MA_FAST}/{MA_SLOW}: {result['cross']}\n"
         f"Momentum: {result['momentum']:+.2f}%\n"
-        f"Timeframe: {INTERVAL}\n\n"
+        f"Volumen vs. promedio: {vol_txt}\n"
+        f"Tendencia {HTF_INTERVAL}: {result['htf_trend']} (alineada) ✅\n"
+        f"Timeframe: {INTERVAL} (vela cerrada)\n\n"
         f"_Watch-only. Vos decidís qué hacer con esto._"
     )
 
 
-# ---------- State (evita spamear la misma alerta repetidamente) ----------
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -223,7 +276,6 @@ def save_state(state):
         json.dump(state, f)
 
 
-# ---------- Main ----------
 def main():
     state = load_state()
     any_sent = False
@@ -236,20 +288,38 @@ def main():
             print(f"[ERROR] {symbol}: no se pudo obtener datos ({e})")
             continue
 
-        result = evaluate(symbol, candles)
-        prev_direction = state.get(symbol)
+        if len([c for c in candles if c["is_closed"]]) < max(RSI_PERIOD, MA_SLOW) + 1:
+            print(f"[WARN] {symbol}: no hay suficientes velas cerradas todavía, se salta este ciclo.")
+            continue
 
-        if result["direction"] and result["direction"] != prev_direction:
+        result = evaluate(symbol, candles)
+
+        symbol_state = state.get(symbol, {})
+        prev_direction = symbol_state.get("direction")
+        prev_candle_time = symbol_state.get("candle_time")
+        same_candle = prev_candle_time == result["last_closed_candle_time"]
+
+        should_alert = (
+            result["direction"]
+            and not (result["direction"] == prev_direction and same_candle)
+        )
+
+        if should_alert:
             send_telegram(format_alert(result))
             any_sent = True
-            state[symbol] = result["direction"]
-        elif not result["direction"]:
-            state[symbol] = None
+
+        state[symbol] = {
+            "direction": result["direction"],
+            "candle_time": result["last_closed_candle_time"],
+        }
 
         print(
             f"{symbol}: price={result['price']:.2f} rsi={result['rsi']} "
             f"cross={result['cross']} mom={result['momentum']:.2f}% "
-            f"direction={result['direction']}"
+            f"vol_ratio={result['volume_ratio']:.2f} "
+            f"base={result['base_direction']} htf_trend={result['htf_trend']} "
+            f"final={result['direction']} "
+            f"blocked_by={result['blocked_by'] or '-'}"
         )
 
     save_state(state)
