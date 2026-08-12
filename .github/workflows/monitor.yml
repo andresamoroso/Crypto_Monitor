@@ -2,10 +2,8 @@ name: Crypto Signal Monitor
 
 on:
   schedule:
-    # Corre cada 15 minutos. Ajustá el cron si querés otra frecuencia.
-    # Sintaxis: minuto hora dia mes dia-semana (siempre en UTC)
-    - cron: '*/15 * * * *'
-  workflow_dispatch: {}   # permite tirarlo a mano desde la pestaña "Actions" de GitHub
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
 
 jobs:
   check-signals:
@@ -33,10 +31,14 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          INTERVAL: '1h'
+          INTERVAL: '15m'
           RSI_PERIOD: '14'
           MA_FAST: '9'
           MA_SLOW: '21'
           RSI_LOW: '30'
           RSI_HIGH: '70'
+          HTF_INTERVAL: '4h'
+          HTF_SMA_PERIOD: '50'
+          REQUIRE_VOLUME: 'true'
+          REQUIRE_HTF_TREND: 'true'
         run: python crypto_monitor.py
