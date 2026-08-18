@@ -24,6 +24,7 @@ Config vía variables de entorno (con defaults razonables):
 import os
 import json
 import sys
+import time
 import requests
 
 # ---------- Config ----------
@@ -51,6 +52,7 @@ TARGET_PCT = float(os.environ.get("TARGET_PCT", 1.5))
 STOP_PCT = float(os.environ.get("STOP_PCT", 1.0))
 HORIZON_CANDLES = int(os.environ.get("HORIZON_CANDLES", 4))
 NOTIFY_ON_RESOLUTION = os.environ.get("NOTIFY_ON_RESOLUTION", "true").lower() == "true"
+SUMMARY_INTERVAL_HOURS = float(os.environ.get("SUMMARY_INTERVAL_HOURS", 24))
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -462,6 +464,42 @@ def format_resolution_message(signal):
     )
 
 
+def maybe_send_daily_summary(state, signals):
+    meta = state.setdefault("_meta", {})
+    last_ts = meta.get("last_summary_ts")
+    now = time.time()
+    if last_ts is not None and (now - last_ts) < SUMMARY_INTERVAL_HOURS * 3600:
+        return  # todavía no toca
+
+    stats = compute_stats(signals)
+    open_count = len([s for s in signals if s["status"] == "open"])
+    total_signals = len(signals)
+
+    if stats:
+        win_rate_txt = f"{stats['win_rate_pct']:.1f}%" if stats["win_rate_pct"] is not None else "—"
+        body = (
+            f"📊 *Resumen diario — Crypto Signal Monitor*\n\n"
+            f"Bot activo, corriendo cada 5 min.\n"
+            f"Señales totales generadas: {total_signals}\n"
+            f"Abiertas ahora: {open_count}\n"
+            f"Cerradas: {stats['total_closed']} "
+            f"(✅ {stats['wins']} · ❌ {stats['losses']} · ⏱ {stats['timeouts']})\n"
+            f"Win rate: {win_rate_txt}\n"
+            f"Retorno promedio por señal: {stats['avg_pct_result']:+.2f}%\n\n"
+            f"_Solo watch-only. Esto no es una recomendación de inversión._"
+        )
+    else:
+        body = (
+            f"📊 *Resumen diario — Crypto Signal Monitor*\n\n"
+            f"Bot activo, corriendo cada 5 min. Todavía no se generó "
+            f"ninguna señal (los filtros son exigentes a propósito) — "
+            f"nada para reportar por ahora."
+        )
+
+    send_telegram(body)
+    meta["last_summary_ts"] = now
+
+
 # ---------- Main ----------
 def main():
     state = load_state()
@@ -521,6 +559,8 @@ def main():
             f"blocked_by={result['blocked_by'] or '-'} "
             f"resolved_this_run={len(resolved)}"
         )
+
+    maybe_send_daily_summary(state, signals)
 
     save_state(state)
     save_signals(signals)
