@@ -4,21 +4,10 @@ Crypto Signal Monitor — watch-only alert bot
 ----------------------------------------------
 Monitorea BTC y ETH en Binance, calcula RSI, cruce de medias móviles y
 momentum sobre velas CERRADAS (evita repintado), y manda una alerta por
-Telegram cuando 2+ señales se alinean.
+Telegram cuando 3 de 4 señales técnicas se alinean, con volumen y
+tendencia mayor como filtros obligatorios.
 
 NO ejecuta órdenes. NO es consejo financiero. Solo vigila y avisa.
-
-Config vía variables de entorno (con defaults razonables):
-  TELEGRAM_BOT_TOKEN   (requerido)
-  TELEGRAM_CHAT_ID     (requerido)
-  SYMBOLS              default "BTCUSDT,ETHUSDT"
-  INTERVAL             default "15m"  (15m, 1h, 4h, 1d — timeframes de Binance)
-  RSI_PERIOD           default 14
-  MA_FAST              default 9
-  MA_SLOW              default 21
-  RSI_LOW              default 30
-  RSI_HIGH             default 70
-  STATE_FILE           default "state.json"
 """
 
 import os
@@ -40,13 +29,11 @@ RSI_HIGH = float(os.environ.get("RSI_HIGH", 70))
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 KLINES_LIMIT = 150
 
-# Filtro de tendencia mayor (timeframe superior) y volumen obligatorio
 HTF_INTERVAL = os.environ.get("HTF_INTERVAL", "4h")
 HTF_SMA_PERIOD = int(os.environ.get("HTF_SMA_PERIOD", 50))
 REQUIRE_VOLUME = os.environ.get("REQUIRE_VOLUME", "true").lower() == "true"
 REQUIRE_HTF_TREND = os.environ.get("REQUIRE_HTF_TREND", "true").lower() == "true"
 
-# Seguimiento de fiabilidad de alertas (paper-testing forward, no histórico)
 SIGNALS_LOG_FILE = os.environ.get("SIGNALS_LOG_FILE", "signals_log.jsonl")
 TARGET_PCT = float(os.environ.get("TARGET_PCT", 1.5))
 STOP_PCT = float(os.environ.get("STOP_PCT", 1.0))
@@ -54,43 +41,42 @@ HORIZON_CANDLES = int(os.environ.get("HORIZON_CANDLES", 4))
 NOTIFY_ON_RESOLUTION = os.environ.get("NOTIFY_ON_RESOLUTION", "true").lower() == "true"
 SUMMARY_INTERVAL_HOURS = float(os.environ.get("SUMMARY_INTERVAL_HOURS", 24))
 
+BB_PERIOD = int(os.environ.get("BB_PERIOD", 20))
+BB_STD = float(os.environ.get("BB_STD", 2.0))
+
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
+USE_ATR_TARGETS = os.environ.get("USE_ATR_TARGETS", "true").lower() == "true"
+TARGET_ATR_MULT = float(os.environ.get("TARGET_ATR_MULT", 1.5))
+STOP_ATR_MULT = float(os.environ.get("STOP_ATR_MULT", 1.0))
+
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
-# ---------- Data ----------
 def fetch_klines(symbol, interval, limit=KLINES_LIMIT):
-    # Pedimos uno de más: el último elemento que devuelve Binance es la
-    # vela EN FORMACIÓN (todavía no cerró). La separamos para no ensuciar
-    # los indicadores con datos que van a seguir cambiando.
     params = {"symbol": symbol, "interval": interval, "limit": limit + 1}
     r = requests.get(BINANCE_URL, params=params, timeout=15)
     r.raise_for_status()
     raw = r.json()
     candles = [
         {
-            "time": k[0],
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
+            "time": k[0], "open": float(k[1]), "high": float(k[2]),
+            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
             "is_closed": True,
         }
         for k in raw
     ]
     if candles:
-        candles[-1]["is_closed"] = False  # la última vela sigue en curso
+        candles[-1]["is_closed"] = False
     return candles
 
 
-# ---------- Indicators ----------
 def sma(values, period):
     out = [None] * len(values)
     for i in range(len(values)):
         if i < period - 1:
             continue
-        out[i] = sum(values[i - period + 1 : i + 1]) / period
+        out[i] = sum(values[i - period + 1: i + 1]) / period
     return out
 
 
@@ -150,10 +136,49 @@ def momentum(closes, lookback):
     return ((now - past) / past) * 100
 
 
+def bollinger_bands(values, period=BB_PERIOD, num_std=BB_STD):
+    mid = sma(values, period)
+    upper = [None] * len(values)
+    lower = [None] * len(values)
+    for i in range(len(values)):
+        if mid[i] is None:
+            continue
+        window = values[i - period + 1: i + 1]
+        mean = mid[i]
+        variance = sum((x - mean) ** 2 for x in window) / period
+        std = variance ** 0.5
+        upper[i] = mean + num_std * std
+        lower[i] = mean - num_std * std
+    return upper, mid, lower
+
+
+def true_range(candles):
+    trs = [None] * len(candles)
+    for i in range(len(candles)):
+        if i == 0:
+            trs[i] = candles[i]["high"] - candles[i]["low"]
+            continue
+        high, low = candles[i]["high"], candles[i]["low"]
+        prev_close = candles[i - 1]["close"]
+        trs[i] = max(high - low, abs(high - prev_close), abs(low - prev_close))
+    return trs
+
+
+def atr(candles, period=ATR_PERIOD):
+    trs = true_range(candles)
+    out = [None] * len(candles)
+    if len(candles) < period + 1:
+        return out
+    first_avg = sum(trs[1:period + 1]) / period
+    out[period] = first_avg
+    prev = first_avg
+    for i in range(period + 1, len(candles)):
+        prev = (prev * (period - 1) + trs[i]) / period
+        out[i] = prev
+    return out
+
+
 def higher_timeframe_trend(symbol):
-    # Tendencia "de fondo": precio de cierre (última vela cerrada) del
-    # timeframe superior vs. su propia media móvil. Simple a propósito —
-    # el objetivo es filtrar, no predecir con precisión.
     try:
         candles = fetch_klines(symbol, HTF_INTERVAL, limit=HTF_SMA_PERIOD + 5)
     except Exception as e:
@@ -176,9 +201,6 @@ def higher_timeframe_trend(symbol):
 
 
 def volume_confirmation(volumes, lookback=20, multiplier=1.2):
-    # ¿El volumen de la última vela cerrada es notablemente mayor al
-    # promedio reciente? Un cruce/RSI extremo con volumen bajo es mucho
-    # menos confiable que el mismo movimiento con volumen alto.
     if len(volumes) < lookback + 1:
         return False, 0.0
     recent = volumes[-1]
@@ -189,11 +211,7 @@ def volume_confirmation(volumes, lookback=20, multiplier=1.2):
     return ratio >= multiplier, ratio
 
 
-# ---------- Signal evaluation ----------
 def evaluate(symbol, candles):
-    # Separamos: la vela en formación solo se usa para mostrar "precio
-    # actual" en el mensaje. TODO el cálculo de indicadores usa únicamente
-    # velas ya cerradas, para evitar señales que aparecen y desaparecen.
     live_price = candles[-1]["close"]
     closed = [c for c in candles if c["is_closed"]]
 
@@ -207,6 +225,11 @@ def evaluate(symbol, candles):
     cross = cross_state(fast_arr, slow_arr)
     mom = momentum(closes, min(10, len(closes) - 1))
     vol_confirmed, vol_ratio = volume_confirmation(volumes)
+
+    bb_upper, bb_mid, bb_lower = bollinger_bands(closes, BB_PERIOD, BB_STD)
+    bb_upper_now, bb_lower_now = last_valid(bb_upper), last_valid(bb_lower)
+    atr_arr = atr(closed, ATR_PERIOD)
+    atr_now = last_valid(atr_arr)
 
     rsi_kind = "neutral"
     if rsi_now is not None:
@@ -227,18 +250,22 @@ def evaluate(symbol, candles):
     elif mom < -1.2:
         mom_kind = "bear"
 
-    bull = [rsi_kind, cross_kind, mom_kind].count("bull")
-    bear = [rsi_kind, cross_kind, mom_kind].count("bear")
+    bb_kind = "neutral"
+    if bb_lower_now is not None and closes[-1] <= bb_lower_now:
+        bb_kind = "bull"
+    elif bb_upper_now is not None and closes[-1] >= bb_upper_now:
+        bb_kind = "bear"
 
-    # Señal base: 2 de 3 indicadores alineados (igual que antes)
+    signal_kinds = [rsi_kind, cross_kind, mom_kind, bb_kind]
+    bull = signal_kinds.count("bull")
+    bear = signal_kinds.count("bear")
+
     base_direction = None
-    if bull >= 2:
+    if bull >= 3:
         base_direction = "bull"
-    elif bear >= 2:
+    elif bear >= 3:
         base_direction = "bear"
 
-    # Color de la última vela cerrada (para chequear si el volumen
-    # acompaña realmente en la misma dirección que la señal base)
     last_candle = closed[-1] if closed else None
     candle_direction = None
     if last_candle:
@@ -249,7 +276,6 @@ def evaluate(symbol, candles):
 
     htf_trend = higher_timeframe_trend(symbol)
 
-    # ---- Cascada de gates ----
     direction = base_direction
     gate_reasons = []
 
@@ -271,6 +297,8 @@ def evaluate(symbol, candles):
         "rsi": rsi_now,
         "cross": cross,
         "momentum": mom,
+        "bb_kind": bb_kind,
+        "atr": atr_now,
         "volume_confirmed": vol_confirmed,
         "volume_ratio": vol_ratio,
         "base_direction": base_direction,
@@ -281,7 +309,6 @@ def evaluate(symbol, candles):
     }
 
 
-# ---------- Telegram ----------
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[WARN] Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID — no se envía alerta.")
@@ -301,20 +328,23 @@ def format_alert(result):
         else "posible agotamiento (señales bajistas alineadas)"
     rsi_txt = f"{result['rsi']:.1f}" if result["rsi"] is not None else "—"
     vol_txt = f"{result['volume_ratio']:.2f}x" + (" ✅ confirma" if result["volume_confirmed"] else " (débil)")
+    bb_txt = {"bull": "precio en banda inferior", "bear": "precio en banda superior", "neutral": "dentro de banda"}[result["bb_kind"]]
+    atr_txt = f"${result['atr']:,.2f}" if result["atr"] else "—"
     return (
         f"{icon} *{label}* — {tag}\n"
         f"Precio: ${result['price']:,.2f}\n"
         f"RSI({RSI_PERIOD}): {rsi_txt}\n"
         f"Medias {MA_FAST}/{MA_SLOW}: {result['cross']}\n"
         f"Momentum: {result['momentum']:+.2f}%\n"
+        f"Bollinger({BB_PERIOD}): {bb_txt}\n"
         f"Volumen vs. promedio: {vol_txt}\n"
         f"Tendencia {HTF_INTERVAL}: {result['htf_trend']} (alineada) ✅\n"
+        f"ATR({ATR_PERIOD}): {atr_txt} (target/stop calculados con esto)\n"
         f"Timeframe: {INTERVAL} (vela cerrada)\n\n"
         f"_Watch-only. Vos decidís qué hacer con esto._"
     )
 
 
-# ---------- State (evita spamear la misma alerta repetidamente) ----------
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -330,7 +360,6 @@ def save_state(state):
         json.dump(state, f)
 
 
-# ---------- Registro de fiabilidad de alertas (forward paper-testing) ----------
 def load_signals():
     if not os.path.exists(SIGNALS_LOG_FILE):
         return []
@@ -352,12 +381,28 @@ def save_signals(signals):
 def new_signal_record(result):
     entry_price = result["price"]
     direction = result["direction"]
-    if direction == "bull":
-        target_price = entry_price * (1 + TARGET_PCT / 100)
-        stop_price = entry_price * (1 - STOP_PCT / 100)
+    atr_val = result.get("atr")
+
+    if USE_ATR_TARGETS and atr_val:
+        sizing_method = "atr"
+        if direction == "bull":
+            target_price = entry_price + atr_val * TARGET_ATR_MULT
+            stop_price = entry_price - atr_val * STOP_ATR_MULT
+        else:
+            target_price = entry_price - atr_val * TARGET_ATR_MULT
+            stop_price = entry_price + atr_val * STOP_ATR_MULT
     else:
-        target_price = entry_price * (1 - TARGET_PCT / 100)
-        stop_price = entry_price * (1 + STOP_PCT / 100)
+        sizing_method = "fixed_pct"
+        if direction == "bull":
+            target_price = entry_price * (1 + TARGET_PCT / 100)
+            stop_price = entry_price * (1 - STOP_PCT / 100)
+        else:
+            target_price = entry_price * (1 - TARGET_PCT / 100)
+            stop_price = entry_price * (1 + STOP_PCT / 100)
+
+    target_pct = abs(target_price - entry_price) / entry_price * 100
+    stop_pct = abs(stop_price - entry_price) / entry_price * 100
+
     return {
         "id": f"{result['symbol']}-{result['last_closed_candle_time']}-{direction}",
         "symbol": result["symbol"],
@@ -366,8 +411,10 @@ def new_signal_record(result):
         "entry_price": entry_price,
         "target_price": target_price,
         "stop_price": stop_price,
-        "target_pct": TARGET_PCT,
-        "stop_pct": STOP_PCT,
+        "target_pct": round(target_pct, 3),
+        "stop_pct": round(stop_pct, 3),
+        "sizing_method": sizing_method,
+        "atr_at_signal": atr_val,
         "horizon_candles": HORIZON_CANDLES,
         "status": "open",
         "outcome": None,
@@ -404,7 +451,7 @@ def resolve_open_signals(open_signals_for_symbol, closed_candles):
 
             outcome, exit_price = None, None
             if hit_target and hit_stop:
-                outcome, exit_price = "stop_hit", signal["stop_price"]  # supuesto conservador
+                outcome, exit_price = "stop_hit", signal["stop_price"]
             elif hit_target:
                 outcome, exit_price = "target_hit", signal["target_price"]
             elif hit_stop:
@@ -434,7 +481,7 @@ def compute_stats(signals):
     wins = [s for s in closed if s["outcome"] == "target_hit"]
     losses = [s for s in closed if s["outcome"] == "stop_hit"]
     timeouts = [s for s in closed if s["outcome"] == "timeout"]
-    decided = wins + losses  # timeouts no cuentan para el win rate
+    decided = wins + losses
     win_rate = (len(wins) / len(decided) * 100) if decided else None
     avg_pct = sum(s["pct_result"] for s in closed) / len(closed)
     return {
@@ -469,7 +516,7 @@ def maybe_send_daily_summary(state, signals):
     last_ts = meta.get("last_summary_ts")
     now = time.time()
     if last_ts is not None and (now - last_ts) < SUMMARY_INTERVAL_HOURS * 3600:
-        return  # todavía no toca
+        return
 
     stats = compute_stats(signals)
     open_count = len([s for s in signals if s["status"] == "open"])
@@ -500,7 +547,6 @@ def maybe_send_daily_summary(state, signals):
     meta["last_summary_ts"] = now
 
 
-# ---------- Main ----------
 def main():
     state = load_state()
     signals = load_signals()
@@ -515,19 +561,17 @@ def main():
             continue
 
         closed_candles = [c for c in candles if c["is_closed"]]
-        if len(closed_candles) < max(RSI_PERIOD, MA_SLOW) + 1:
+        min_needed = max(RSI_PERIOD, MA_SLOW, BB_PERIOD, ATR_PERIOD) + 1
+        if len(closed_candles) < min_needed:
             print(f"[WARN] {symbol}: no hay suficientes velas cerradas todavía, se salta este ciclo.")
             continue
 
-        # 1) Resolver señales pendientes de este símbolo contra las velas
-        #    nuevas que llegaron desde que se generaron.
         open_for_symbol = [s for s in signals if s["symbol"] == symbol and s["status"] == "open"]
         resolved = resolve_open_signals(open_for_symbol, closed_candles)
         if resolved and NOTIFY_ON_RESOLUTION:
             for s in resolved:
                 send_telegram(format_resolution_message(s))
 
-        # 2) Evaluar si hay una señal NUEVA en este ciclo.
         result = evaluate(symbol, candles)
 
         symbol_state = state.get(symbol, {})
@@ -553,6 +597,7 @@ def main():
         print(
             f"{symbol}: price={result['price']:.2f} rsi={result['rsi']} "
             f"cross={result['cross']} mom={result['momentum']:.2f}% "
+            f"bb={result['bb_kind']} atr={result['atr']} "
             f"vol_ratio={result['volume_ratio']:.2f} "
             f"base={result['base_direction']} htf_trend={result['htf_trend']} "
             f"final={result['direction']} "
