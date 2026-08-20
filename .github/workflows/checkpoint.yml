@@ -1,0 +1,29 @@
+name: Crypto Checkpoint Report
+
+on:
+  schedule:
+    # Los días 1 y 15 de cada mes a las 09:00 UTC — una cadencia quincenal simple
+    - cron: '0 9 1,15 * *'
+  workflow_dispatch: {}
+
+jobs:
+  checkpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run checkpoint report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_SAMPLES_FOR_FLAGS: '8'
+        run: python crypto_checkpoint_report.py
