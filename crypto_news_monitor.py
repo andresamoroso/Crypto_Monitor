@@ -163,9 +163,8 @@ def main():
     total_candidates = len(macro_candidates) + sum(len(v) for v in asset_candidates.values())
 
     # ---- Siempre: registrar/resolver impacto, aunque no haya noticias nuevas ----
-    market_cap_now = cni.fetch_global_market_cap()
     impact_events = cni.load_impact_log()
-    n_resolved = cni.resolve_open_events(impact_events, market_cap_now)
+    n_resolved = cni.resolve_open_events(impact_events)
     print(f"Impacto: {n_resolved} evento(s) resuelto(s) esta corrida.")
 
     if total_candidates == 0:
@@ -221,12 +220,19 @@ def main():
         for _, it, h in entries:
             seen[h] = {"ts": now}
 
-    # ---- Registrar en el sistema de calibración (con precio/market cap YA de esta corrida) ----
-    to_log = [{"symbol": "macro", "category": "macro", "title": it["title"], "link": it["link"]} for it, h in macro_to_send]
+    # ---- Registrar en el sistema de calibración (con la hora REAL de
+    # publicación de cada noticia, no el momento de esta corrida) ----
+    to_log = [
+        {"symbol": "macro", "category": "macro", "title": it["title"], "link": it["link"], "published_at": it["pub_ts"]}
+        for it, h in macro_to_send
+    ]
     for symbol, entries in asset_to_send.items():
         for label, it, h in entries:
-            to_log.append({"symbol": symbol, "category": symbol, "title": it["title"], "link": it["link"]})
-    n_logged = cni.log_news_events(impact_events, to_log, market_cap_now)
+            to_log.append({
+                "symbol": symbol, "category": symbol, "title": it["title"],
+                "link": it["link"], "published_at": it["pub_ts"],
+            })
+    n_logged = cni.log_news_events(impact_events, to_log)
     print(f"Registrados {n_logged} evento(s) nuevo(s) en el sistema de calibración.")
 
     state["seen"] = seen
