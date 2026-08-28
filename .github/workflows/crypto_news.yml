@@ -32,7 +32,8 @@ jobs:
           MAX_ITEMS_PER_SECTION_IN_MSG: '8'
           MAX_TOTAL_ITEMS_PER_MESSAGE: '30'
           SEEN_TTL_DAYS: '20'
-          CRYPTO_NEWS_HORIZON_RUNS: '2'
+          CRYPTO_NEWS_HORIZON_HOURS: '24'
+          CRYPTO_NEWS_ANCHOR_INTERVAL_MIN: '15'
         run: python crypto_news_monitor.py
 
       - name: Guardar estado y registro de impacto
