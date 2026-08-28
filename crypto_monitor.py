@@ -61,26 +61,42 @@ HORIZON_CANDLES = int(os.environ.get("HORIZON_CANDLES", 4))
 NOTIFY_ON_RESOLUTION = os.environ.get("NOTIFY_ON_RESOLUTION", "true").lower() == "true"
 SUMMARY_INTERVAL_HOURS = float(os.environ.get("SUMMARY_INTERVAL_HOURS", 24))
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_PAIR_MAP = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD"}
+KRAKEN_INTERVAL_MAP = {"15m": 15, "4h": 240, "1d": 1440}
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
 # ==================== Datos ====================
 def fetch_klines(symbol, interval, limit=KLINES_LIMIT):
-    params = {"symbol": symbol, "interval": interval, "limit": limit + 1}
-    r = requests.get(BINANCE_URL, params=params, timeout=15)
+    pair = KRAKEN_PAIR_MAP.get(symbol)
+    kraken_interval = KRAKEN_INTERVAL_MAP.get(interval)
+    if not pair or not kraken_interval:
+        raise ValueError(f"Símbolo o intervalo no soportado en Kraken: {symbol} {interval}")
+
+    r = requests.get(KRAKEN_URL, params={"pair": pair, "interval": kraken_interval}, timeout=15)
     r.raise_for_status()
-    raw = r.json()
+    data = r.json()
+    if data.get("error"):
+        raise RuntimeError(f"Kraken devolvió error: {data['error']}")
+
+    result = data["result"]
+    # La respuesta trae la clave del par (ej. "XXBTZUSD") + "last" al mismo
+    # nivel — nos quedamos con la que NO es "last", sin asumir el nombre exacto.
+    candles_key = next(k for k in result.keys() if k != "last")
+    raw = result[candles_key][-(limit + 1):]
+
     candles = [
         {
-            "time": k[0], "open": float(k[1]), "high": float(k[2]),
-            "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+            "time": int(row[0]) * 1000,  # Kraken usa segundos; normalizamos a ms (igual que antes)
+            "open": float(row[1]), "high": float(row[2]),
+            "low": float(row[3]), "close": float(row[4]), "volume": float(row[6]),
             "is_closed": True,
         }
-        for k in raw
+        for row in raw
     ]
     if candles:
-        candles[-1]["is_closed"] = False
+        candles[-1]["is_closed"] = False  # misma vela en curso, mismo criterio de antes
     return candles
 
 
