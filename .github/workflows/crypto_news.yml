@@ -1,0 +1,51 @@
+name: Crypto News Digest
+
+on:
+  schedule:
+    - cron: '0 8,20 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  news-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run crypto news monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_ITEMS_PER_ASSET: '4'
+          MAX_ITEMS_PER_MACRO_TOPIC: '4'
+          MAX_ITEMS_PER_SECTION_IN_MSG: '8'
+          MAX_TOTAL_ITEMS_PER_MESSAGE: '30'
+          SEEN_TTL_DAYS: '20'
+          CRYPTO_NEWS_HORIZON_RUNS: '2'
+        run: python crypto_news_monitor.py
+
+      - name: Guardar estado y registro de impacto
+        run: |
+          git config user.name "crypto-news-bot"
+          git config user.email "actions@github.com"
+          for f in crypto_news_state.json crypto_news_impact_log.jsonl; do
+            [ -f "$f" ] && git add "$f"
+          done
+          if git diff --cached --quiet; then
+            echo "Sin cambios para commitear."
+          else
+            git commit -m "Actualiza estado de noticias e impacto cripto [skip ci]"
+            git pull --rebase
+            git push
+          fi
