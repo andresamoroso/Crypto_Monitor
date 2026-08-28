@@ -14,9 +14,11 @@ import os
 import sys
 import json
 import requests
+import crypto_news_impact as cni
 
 SIGNALS_LOG_FILE = os.environ.get("SIGNALS_LOG_FILE", "signals_log.jsonl")
 MIN_SAMPLES_FOR_FLAGS = int(os.environ.get("MIN_SAMPLES_FOR_FLAGS", 8))
+NEWS_CORRELATION_WINDOW_HOURS = float(os.environ.get("NEWS_CORRELATION_WINDOW_HOURS", 6))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -65,6 +67,29 @@ def group_stats(closed, key_fn, min_n=3):
         avg = sum(s["pct_result"] for s in items) / len(items)
         out[key] = {"n": len(items), "win_rate": wr, "avg_pct": avg}
     return out
+
+
+def correlate_with_news(closed_signals, news_events, window_hours=NEWS_CORRELATION_WINDOW_HOURS):
+    """
+    Por cada señal cerrada, busca si hubo una noticia (de esa moneda, o
+    macro) publicada dentro de ±window_hours de cuando se detectó la
+    señal. Devuelve dos grupos: señales con noticia cerca, y sin ninguna.
+    """
+    window_s = window_hours * 3600
+    with_news, without_news = [], []
+
+    for sig in closed_signals:
+        signal_time_s = sig["signal_candle_time"] / 1000  # se guardó en ms
+        found = False
+        for ev in news_events:
+            if ev["symbol"] not in (sig["symbol"], "macro"):
+                continue
+            if abs(ev["published_at"] - signal_time_s) <= window_s:
+                found = True
+                break
+        (with_news if found else without_news).append(sig)
+
+    return with_news, without_news
 
 
 def main():
@@ -125,6 +150,24 @@ def main():
             label = tier_labels.get(tier, tier)
             lines.append(f"• {label}: win rate {wr_txt}, retorno prom. {s['avg_pct']:+.2f}% (n={s['n']})")
         lines.append("")
+
+    # ---- Cruce con noticias: ¿las alertas con noticia cerca acertaron más? ----
+    news_events = cni.load_impact_log()
+    with_news, without_news = correlate_with_news(closed, news_events)
+    lines.append(f"*Cruce con noticias (ventana ±{NEWS_CORRELATION_WINDOW_HOURS:.0f}hs):*")
+    if len(with_news) >= 3 and len(without_news) >= 3:
+        wr_with, _, n_with = win_rate(with_news)
+        wr_without, _, n_without = win_rate(without_news)
+        wr_with_txt = f"{wr_with:.0f}%" if wr_with is not None else "—"
+        wr_without_txt = f"{wr_without:.0f}%" if wr_without is not None else "—"
+        lines.append(f"• CON noticia relacionada cerca: win rate {wr_with_txt} (n={len(with_news)})")
+        lines.append(f"• SIN ninguna noticia cerca: win rate {wr_without_txt} (n={len(without_news)})")
+    else:
+        lines.append(
+            f"Todavía pocas señales para comparar (con noticia: {len(with_news)}, "
+            f"sin noticia: {len(without_news)}) — hace falta más historial."
+        )
+    lines.append("")
 
     # ---- Señales de alerta (heurísticas simples, no un juicio definitivo) ----
     flags = []
