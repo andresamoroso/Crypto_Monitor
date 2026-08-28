@@ -62,7 +62,7 @@ NOTIFY_ON_RESOLUTION = os.environ.get("NOTIFY_ON_RESOLUTION", "true").lower() ==
 SUMMARY_INTERVAL_HOURS = float(os.environ.get("SUMMARY_INTERVAL_HOURS", 24))
 
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
-KRAKEN_PAIR_MAP = {"BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD"}
+KRAKEN_PAIR_MAP = {"BTCUSDT": "XBTEUR", "ETHUSDT": "ETHEUR"}
 KRAKEN_INTERVAL_MAP = {"15m": 15, "4h": 240, "1d": 1440}
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -324,7 +324,7 @@ def format_reversal_alert(result, trend, tier):
     }[tier]
     return (
         f"{icon} *{label}* — {tag}\n"
-        f"Precio: ${result['price']:,.2f}\n"
+        f"Precio: €{result['price']:,.2f}\n"
         f"RSI(14): {result['rsi']:.1f}\n"
         f"Volumen: {result['vol_ratio']:.2f}x el promedio\n"
         f"Tendencia mayor (4h/1d): *{trend['status']}*\n"
@@ -433,7 +433,7 @@ def format_resolution_message(signal):
     outcome_txt = {"target_hit": "TARGET alcanzado", "stop_hit": "STOP alcanzado", "timeout": "sin definir (timeout)"}[signal["outcome"]]
     return (
         f"{icon} *{label}* ({signal['direction']}, tier {signal['tier']}) — {outcome_txt}\n"
-        f"Entrada: ${signal['entry_price']:,.2f} → Salida: ${signal['exit_price']:,.2f}\n"
+        f"Entrada: €{signal['entry_price']:,.2f} → Salida: €{signal['exit_price']:,.2f}\n"
         f"Resultado: {signal['pct_result']:+.2f}%"
     )
 
