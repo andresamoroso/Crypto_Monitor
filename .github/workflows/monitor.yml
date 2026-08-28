@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # necesario para que el bot pueda commitear el registro de señales
+  contents: write
 
 jobs:
   check-signals:
@@ -27,20 +27,31 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          INTERVAL: '15m'
+          # Sistema 1: zona de giro (15m)
+          REVERSAL_INTERVAL: '15m'
           RSI_PERIOD: '14'
-          MA_FAST: '9'
-          MA_SLOW: '21'
           RSI_LOW: '30'
           RSI_HIGH: '70'
-          HTF_INTERVAL: '4h'
-          HTF_SMA_PERIOD: '50'
-          REQUIRE_VOLUME: 'true'
-          REQUIRE_HTF_TREND: 'true'
-          TARGET_PCT: '1.5'
-          STOP_PCT: '1.0'
+          BB_PERIOD: '20'
+          BB_STD: '2.0'
+          VOLUME_LOOKBACK: '20'
+          VOLUME_MULTIPLIER: '1.5'
+          # Sistema 2: estado de tendencia (4h + 1d)
+          TREND_INTERVAL: '4h'
+          DAILY_INTERVAL: '1d'
+          MA_FAST: '9'
+          MA_SLOW: '21'
+          ATR_PERIOD: '14'
+          MOMENTUM_LOOKBACK: '10'
+          MOMENTUM_ATR_MULTIPLIER: '1.5'
+          USE_DAILY_CONFIRMATION: 'true'
+          DAILY_SMA: '50'
+          # Paper-testing
+          TARGET_ATR_MULT: '1.5'
+          STOP_ATR_MULT: '1.0'
           HORIZON_CANDLES: '4'
           NOTIFY_ON_RESOLUTION: 'true'
+          SUMMARY_INTERVAL_HOURS: '24'
         run: python crypto_monitor.py
 
       - name: Guardar estado y registro de señales en el repo
