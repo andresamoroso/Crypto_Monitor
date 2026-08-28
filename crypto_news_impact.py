@@ -24,8 +24,10 @@ import requests
 IMPACT_LOG_FILE = os.environ.get("CRYPTO_NEWS_IMPACT_LOG_FILE", "crypto_news_impact_log.jsonl")
 HORIZON_RUNS = int(os.environ.get("CRYPTO_NEWS_HORIZON_RUNS", 2))  # ~24hs con 2 corridas/día
 
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"  # sin usar; se deja por referencia
+COINGECKO_SIMPLE_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
+COINGECKO_ID_MAP = {"BTCUSDT": "bitcoin", "ETHUSDT": "ethereum"}
 
 # ---------- Palabras clave relevantes para noticias de cripto ----------
 EVENT_KEYWORDS = {
@@ -63,12 +65,20 @@ def detect_keywords(title):
 
 # ---------- Precio y benchmark en vivo (un solo punto, no una serie) ----------
 def fetch_price(symbol):
+    coin_id = COINGECKO_ID_MAP.get(symbol)
+    if not coin_id:
+        print(f"[WARN] Símbolo desconocido para CoinGecko: {symbol}")
+        return None
     try:
-        r = requests.get(BINANCE_PRICE_URL, params={"symbol": symbol}, timeout=15)
+        r = requests.get(
+            COINGECKO_SIMPLE_PRICE_URL,
+            params={"ids": coin_id, "vs_currencies": "usd"},
+            timeout=15,
+        )
         r.raise_for_status()
-        return float(r.json()["price"])
+        return float(r.json()[coin_id]["usd"])
     except Exception as e:
-        print(f"[WARN] No se pudo obtener precio de {symbol}: {e}")
+        print(f"[WARN] No se pudo obtener precio de {symbol} vía CoinGecko: {e}")
         return None
 
 
