@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """
-Crypto Signal Monitor — watch-only alert bot
-----------------------------------------------
-Monitorea BTC y ETH en Binance, calcula RSI, cruce de medias móviles y
-momentum sobre velas CERRADAS (evita repintado), y manda una alerta por
-Telegram cuando 3 de 4 señales técnicas se alinean, con volumen y
-tendencia mayor como filtros obligatorios.
+Crypto Signal Monitor v3 — dos sistemas separados
+----------------------------------------------------
+Sistema 1 (Zona de giro, velas de 15m): detecta posibles puntos de
+entrada — RSI en extremo + precio en el borde de Bollinger + volumen que
+confirma. No exige que la tendencia mayor esté de acuerdo, porque un giro
+por definición ocurre en contra de lo que venía pasando.
+
+Sistema 2 (Estado de tendencia, velas de 4h + 1d): reporta si la
+tendencia mayor está alcista, bajista o neutral — no es una alerta
+puntual, es un estado que se recalcula cada corrida, y avisa por Telegram
+solo cuando ese estado CAMBIA (para no repetir lo mismo todo el día).
+
+Las dos alertas de giro se combinan con el estado de tendencia vigente
+para etiquetar qué tan fuerte es la señal: si la tendencia mayor confirma
+el giro, si es neutral, o si va en contra (más riesgo).
 
 NO ejecuta órdenes. NO es consejo financiero. Solo vigila y avisa.
 """
@@ -16,43 +25,47 @@ import sys
 import time
 import requests
 
-# ---------- Config ----------
+# ---------- Config general ----------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SYMBOLS = os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
-INTERVAL = os.environ.get("INTERVAL", "15m")
-RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
-MA_FAST = int(os.environ.get("MA_FAST", 9))
-MA_SLOW = int(os.environ.get("MA_SLOW", 21))
-RSI_LOW = float(os.environ.get("RSI_LOW", 30))
-RSI_HIGH = float(os.environ.get("RSI_HIGH", 70))
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 KLINES_LIMIT = 150
 
-HTF_INTERVAL = os.environ.get("HTF_INTERVAL", "4h")
-HTF_SMA_PERIOD = int(os.environ.get("HTF_SMA_PERIOD", 50))
-REQUIRE_VOLUME = os.environ.get("REQUIRE_VOLUME", "true").lower() == "true"
-REQUIRE_HTF_TREND = os.environ.get("REQUIRE_HTF_TREND", "true").lower() == "true"
+# ---------- Sistema 1: Zona de giro (15m) ----------
+REVERSAL_INTERVAL = os.environ.get("REVERSAL_INTERVAL", "15m")
+RSI_PERIOD = int(os.environ.get("RSI_PERIOD", 14))
+RSI_LOW = float(os.environ.get("RSI_LOW", 30))
+RSI_HIGH = float(os.environ.get("RSI_HIGH", 70))
+BB_PERIOD = int(os.environ.get("BB_PERIOD", 20))
+BB_STD = float(os.environ.get("BB_STD", 2.0))
+VOLUME_LOOKBACK = int(os.environ.get("VOLUME_LOOKBACK", 20))
+VOLUME_MULTIPLIER = float(os.environ.get("VOLUME_MULTIPLIER", 1.5))
 
+# ---------- Sistema 2: Estado de tendencia (4h + 1d) ----------
+TREND_INTERVAL = os.environ.get("TREND_INTERVAL", "4h")
+DAILY_INTERVAL = os.environ.get("DAILY_INTERVAL", "1d")
+MA_FAST = int(os.environ.get("MA_FAST", 9))
+MA_SLOW = int(os.environ.get("MA_SLOW", 21))
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
+MOMENTUM_LOOKBACK = int(os.environ.get("MOMENTUM_LOOKBACK", 10))
+MOMENTUM_ATR_MULTIPLIER = float(os.environ.get("MOMENTUM_ATR_MULTIPLIER", 1.5))
+USE_DAILY_CONFIRMATION = os.environ.get("USE_DAILY_CONFIRMATION", "true").lower() == "true"
+DAILY_SMA = int(os.environ.get("DAILY_SMA", 50))
+
+# ---------- Paper-testing de las señales de giro ----------
 SIGNALS_LOG_FILE = os.environ.get("SIGNALS_LOG_FILE", "signals_log.jsonl")
-TARGET_PCT = float(os.environ.get("TARGET_PCT", 1.5))
-STOP_PCT = float(os.environ.get("STOP_PCT", 1.0))
+TARGET_ATR_MULT = float(os.environ.get("TARGET_ATR_MULT", 1.5))
+STOP_ATR_MULT = float(os.environ.get("STOP_ATR_MULT", 1.0))
 HORIZON_CANDLES = int(os.environ.get("HORIZON_CANDLES", 4))
 NOTIFY_ON_RESOLUTION = os.environ.get("NOTIFY_ON_RESOLUTION", "true").lower() == "true"
 SUMMARY_INTERVAL_HOURS = float(os.environ.get("SUMMARY_INTERVAL_HOURS", 24))
-
-BB_PERIOD = int(os.environ.get("BB_PERIOD", 20))
-BB_STD = float(os.environ.get("BB_STD", 2.0))
-
-ATR_PERIOD = int(os.environ.get("ATR_PERIOD", 14))
-USE_ATR_TARGETS = os.environ.get("USE_ATR_TARGETS", "true").lower() == "true"
-TARGET_ATR_MULT = float(os.environ.get("TARGET_ATR_MULT", 1.5))
-STOP_ATR_MULT = float(os.environ.get("STOP_ATR_MULT", 1.0))
 
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
+# ==================== Datos ====================
 def fetch_klines(symbol, interval, limit=KLINES_LIMIT):
     params = {"symbol": symbol, "interval": interval, "limit": limit + 1}
     r = requests.get(BINANCE_URL, params=params, timeout=15)
@@ -71,6 +84,11 @@ def fetch_klines(symbol, interval, limit=KLINES_LIMIT):
     return candles
 
 
+def closed_only(candles):
+    return [c for c in candles if c["is_closed"]]
+
+
+# ==================== Indicadores (compartidos) ====================
 def sma(values, period):
     out = [None] * len(values)
     for i in range(len(values)):
@@ -110,6 +128,22 @@ def last_valid(arr):
     return None
 
 
+def bollinger_bands(values, period, num_std):
+    mid = sma(values, period)
+    upper = [None] * len(values)
+    lower = [None] * len(values)
+    for i in range(len(values)):
+        if mid[i] is None:
+            continue
+        window = values[i - period + 1: i + 1]
+        mean = mid[i]
+        variance = sum((x - mean) ** 2 for x in window) / period
+        std = variance ** 0.5
+        upper[i] = mean + num_std * std
+        lower[i] = mean - num_std * std
+    return upper, mid, lower
+
+
 def cross_state(fast_arr, slow_arr):
     n = len(fast_arr)
     i_last = -1
@@ -128,30 +162,6 @@ def cross_state(fast_arr, slow_arr):
     return "above" if cur_diff > 0 else "below"
 
 
-def momentum(closes, lookback):
-    n = len(closes)
-    if n < lookback + 1:
-        return 0.0
-    past, now = closes[n - 1 - lookback], closes[n - 1]
-    return ((now - past) / past) * 100
-
-
-def bollinger_bands(values, period=BB_PERIOD, num_std=BB_STD):
-    mid = sma(values, period)
-    upper = [None] * len(values)
-    lower = [None] * len(values)
-    for i in range(len(values)):
-        if mid[i] is None:
-            continue
-        window = values[i - period + 1: i + 1]
-        mean = mid[i]
-        variance = sum((x - mean) ** 2 for x in window) / period
-        std = variance ** 0.5
-        upper[i] = mean + num_std * std
-        lower[i] = mean - num_std * std
-    return upper, mid, lower
-
-
 def true_range(candles):
     trs = [None] * len(candles)
     for i in range(len(candles)):
@@ -164,7 +174,7 @@ def true_range(candles):
     return trs
 
 
-def atr(candles, period=ATR_PERIOD):
+def atr(candles, period):
     trs = true_range(candles)
     out = [None] * len(candles)
     if len(candles) < period + 1:
@@ -178,29 +188,7 @@ def atr(candles, period=ATR_PERIOD):
     return out
 
 
-def higher_timeframe_trend(symbol):
-    try:
-        candles = fetch_klines(symbol, HTF_INTERVAL, limit=HTF_SMA_PERIOD + 5)
-    except Exception as e:
-        print(f"[WARN] {symbol}: no se pudo obtener tendencia {HTF_INTERVAL} ({e})")
-        return None
-    closed = [c for c in candles if c["is_closed"]]
-    closes = [c["close"] for c in closed]
-    if len(closes) < HTF_SMA_PERIOD:
-        return None
-    ma = sma(closes, HTF_SMA_PERIOD)
-    ma_now = last_valid(ma)
-    if ma_now is None:
-        return None
-    last_close = closes[-1]
-    if last_close > ma_now:
-        return "bull"
-    if last_close < ma_now:
-        return "bear"
-    return None
-
-
-def volume_confirmation(volumes, lookback=20, multiplier=1.2):
+def volume_confirmation(volumes, lookback, multiplier):
     if len(volumes) < lookback + 1:
         return False, 0.0
     recent = volumes[-1]
@@ -211,155 +199,136 @@ def volume_confirmation(volumes, lookback=20, multiplier=1.2):
     return ratio >= multiplier, ratio
 
 
-def evaluate(symbol, candles):
-    live_price = candles[-1]["close"]
-    closed = [c for c in candles if c["is_closed"]]
-
+# ==================== Sistema 1: Zona de giro ====================
+def evaluate_reversal(symbol, candles_15m):
+    live_price = candles_15m[-1]["close"]
+    closed = closed_only(candles_15m)
     closes = [c["close"] for c in closed]
     volumes = [c["volume"] for c in closed]
 
     rsi_arr = rsi(closes, RSI_PERIOD)
     rsi_now = last_valid(rsi_arr)
-    fast_arr = sma(closes, MA_FAST)
-    slow_arr = sma(closes, MA_SLOW)
-    cross = cross_state(fast_arr, slow_arr)
-    mom = momentum(closes, min(10, len(closes) - 1))
-    vol_confirmed, vol_ratio = volume_confirmation(volumes)
-
     bb_upper, bb_mid, bb_lower = bollinger_bands(closes, BB_PERIOD, BB_STD)
     bb_upper_now, bb_lower_now = last_valid(bb_upper), last_valid(bb_lower)
     atr_arr = atr(closed, ATR_PERIOD)
     atr_now = last_valid(atr_arr)
-
-    rsi_kind = "neutral"
-    if rsi_now is not None:
-        if rsi_now <= RSI_LOW:
-            rsi_kind = "bull"
-        elif rsi_now >= RSI_HIGH:
-            rsi_kind = "bear"
-
-    cross_kind = "neutral"
-    if cross == "bull_cross":
-        cross_kind = "bull"
-    elif cross == "bear_cross":
-        cross_kind = "bear"
-
-    mom_kind = "neutral"
-    if mom > 1.2:
-        mom_kind = "bull"
-    elif mom < -1.2:
-        mom_kind = "bear"
-
-    bb_kind = "neutral"
-    if bb_lower_now is not None and closes[-1] <= bb_lower_now:
-        bb_kind = "bull"
-    elif bb_upper_now is not None and closes[-1] >= bb_upper_now:
-        bb_kind = "bear"
-
-    signal_kinds = [rsi_kind, cross_kind, mom_kind, bb_kind]
-    bull = signal_kinds.count("bull")
-    bear = signal_kinds.count("bear")
-
-    base_direction = None
-    if bull >= 3:
-        base_direction = "bull"
-    elif bear >= 3:
-        base_direction = "bear"
+    vol_confirmed, vol_ratio = volume_confirmation(volumes, VOLUME_LOOKBACK, VOLUME_MULTIPLIER)
 
     last_candle = closed[-1] if closed else None
-    candle_direction = None
+    candle_dir = None
     if last_candle:
         if last_candle["close"] > last_candle["open"]:
-            candle_direction = "bull"
+            candle_dir = "bull"
         elif last_candle["close"] < last_candle["open"]:
-            candle_direction = "bear"
+            candle_dir = "bear"
 
-    htf_trend = higher_timeframe_trend(symbol)
-
-    direction = base_direction
-    gate_reasons = []
-
-    if direction and REQUIRE_VOLUME:
-        volume_ok = vol_confirmed and candle_direction == direction
-        if not volume_ok:
-            gate_reasons.append("volumen no confirma")
-            direction = None
-
-    if direction and REQUIRE_HTF_TREND:
-        if htf_trend is None or htf_trend != base_direction:
-            gate_reasons.append(f"tendencia {HTF_INTERVAL} no alineada")
-            direction = None
+    direction = None
+    if (rsi_now is not None and rsi_now <= RSI_LOW
+            and bb_lower_now is not None and closes[-1] <= bb_lower_now
+            and vol_confirmed and candle_dir == "bull"):
+        direction = "bull"
+    elif (rsi_now is not None and rsi_now >= RSI_HIGH
+            and bb_upper_now is not None and closes[-1] >= bb_upper_now
+            and vol_confirmed and candle_dir == "bear"):
+        direction = "bear"
 
     return {
-        "symbol": symbol,
-        "price": live_price,
-        "closed_close": closes[-1] if closes else live_price,
-        "rsi": rsi_now,
-        "cross": cross,
-        "momentum": mom,
-        "bb_kind": bb_kind,
-        "atr": atr_now,
-        "volume_confirmed": vol_confirmed,
-        "volume_ratio": vol_ratio,
-        "base_direction": base_direction,
-        "htf_trend": htf_trend,
-        "direction": direction,
-        "blocked_by": gate_reasons,
+        "symbol": symbol, "price": live_price, "rsi": rsi_now,
+        "vol_ratio": vol_ratio, "atr": atr_now, "direction": direction,
         "last_closed_candle_time": closed[-1]["time"] if closed else None,
     }
 
 
+# ==================== Sistema 2: Estado de tendencia ====================
+def evaluate_trend(symbol, candles_4h, candles_1d):
+    closed_4h = closed_only(candles_4h)
+    closes_4h = [c["close"] for c in closed_4h]
+
+    fast_arr = sma(closes_4h, MA_FAST)
+    slow_arr = sma(closes_4h, MA_SLOW)
+    cross = cross_state(fast_arr, slow_arr)
+    cross_kind = "bull" if cross in ("bull_cross", "above") else "bear" if cross in ("bear_cross", "below") else "neutral"
+
+    atr_arr = atr(closed_4h, ATR_PERIOD)
+    atr_now = last_valid(atr_arr)
+    momentum_kind = "neutral"
+    if atr_now and len(closes_4h) > MOMENTUM_LOOKBACK:
+        change = closes_4h[-1] - closes_4h[-1 - MOMENTUM_LOOKBACK]
+        if change > MOMENTUM_ATR_MULTIPLIER * atr_now:
+            momentum_kind = "bull"
+        elif change < -MOMENTUM_ATR_MULTIPLIER * atr_now:
+            momentum_kind = "bear"
+
+    kinds = [cross_kind, momentum_kind]
+
+    daily_kind = "neutral"
+    if USE_DAILY_CONFIRMATION:
+        closed_1d = closed_only(candles_1d)
+        closes_1d = [c["close"] for c in closed_1d]
+        sma_daily_arr = sma(closes_1d, DAILY_SMA)
+        sma_daily_now = last_valid(sma_daily_arr)
+        if sma_daily_now and closes_1d:
+            daily_kind = "bull" if closes_1d[-1] > sma_daily_now else "bear" if closes_1d[-1] < sma_daily_now else "neutral"
+        kinds.append(daily_kind)
+
+    bull_n, bear_n = kinds.count("bull"), kinds.count("bear")
+    if bull_n > bear_n and bull_n >= 2:
+        status = "alcista"
+    elif bear_n > bull_n and bear_n >= 2:
+        status = "bajista"
+    else:
+        status = "neutral"
+
+    return {
+        "symbol": symbol, "status": status, "cross_kind": cross_kind,
+        "momentum_kind": momentum_kind, "daily_kind": daily_kind,
+    }
+
+
+# ==================== Telegram ====================
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID — no se envía alerta.")
+        print("[WARN] Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
         print(text)
         return
     url = TELEGRAM_URL.format(token=TELEGRAM_BOT_TOKEN)
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    r = requests.post(url, data=payload, timeout=15)
+    r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=15)
     if not r.ok:
         print(f"[ERROR] Telegram respondió {r.status_code}: {r.text}")
 
 
-def format_alert(result):
+def format_reversal_alert(result, trend, tier):
     label = result["symbol"].replace("USDT", "")
     icon = "🟢" if result["direction"] == "bull" else "🔴"
-    tag = "posible rebote (señales alcistas alineadas)" if result["direction"] == "bull" \
-        else "posible agotamiento (señales bajistas alineadas)"
-    rsi_txt = f"{result['rsi']:.1f}" if result["rsi"] is not None else "—"
-    vol_txt = f"{result['volume_ratio']:.2f}x" + (" ✅ confirma" if result["volume_confirmed"] else " (débil)")
-    bb_txt = {"bull": "precio en banda inferior", "bear": "precio en banda superior", "neutral": "dentro de banda"}[result["bb_kind"]]
-    atr_txt = f"${result['atr']:,.2f}" if result["atr"] else "—"
+    tag = "posible zona de compra (giro alcista)" if result["direction"] == "bull" else "posible zona de venta (giro bajista)"
+    tier_txt = {
+        "fuerte": "✅ *la tendencia mayor CONFIRMA este giro*",
+        "moderada": "➖ tendencia mayor neutral, sin oponerse",
+        "contraria": "⚠️ *la tendencia mayor va EN CONTRA de este giro* — más riesgo",
+    }[tier]
     return (
         f"{icon} *{label}* — {tag}\n"
         f"Precio: ${result['price']:,.2f}\n"
-        f"RSI({RSI_PERIOD}): {rsi_txt}\n"
-        f"Medias {MA_FAST}/{MA_SLOW}: {result['cross']}\n"
-        f"Momentum: {result['momentum']:+.2f}%\n"
-        f"Bollinger({BB_PERIOD}): {bb_txt}\n"
-        f"Volumen vs. promedio: {vol_txt}\n"
-        f"Tendencia {HTF_INTERVAL}: {result['htf_trend']} (alineada) ✅\n"
-        f"ATR({ATR_PERIOD}): {atr_txt} (target/stop calculados con esto)\n"
-        f"Timeframe: {INTERVAL} (vela cerrada)\n\n"
+        f"RSI(14): {result['rsi']:.1f}\n"
+        f"Volumen: {result['vol_ratio']:.2f}x el promedio\n"
+        f"Tendencia mayor (4h/1d): *{trend['status']}*\n"
+        f"{tier_txt}\n"
+        f"Timeframe de la señal: {REVERSAL_INTERVAL} (vela cerrada)\n\n"
         f"_Watch-only. Vos decidís qué hacer con esto._"
     )
 
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+def format_trend_change(symbol, prev_status, new_status):
+    label = symbol.replace("USDT", "")
+    icon = {"alcista": "🟢", "bajista": "🔴", "neutral": "⚪"}[new_status]
+    return (
+        f"{icon} *{label}* — cambio de tendencia mayor\n"
+        f"{prev_status or 'sin dato previo'} → *{new_status}*\n"
+        f"_Basado en 4h + 1d. Esto es informativo, no una alerta de entrada._"
+    )
 
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-
+# ==================== Registro para medir aciertos ====================
 def load_signals():
     if not os.path.exists(SIGNALS_LOG_FILE):
         return []
@@ -378,13 +347,11 @@ def save_signals(signals):
             f.write(json.dumps(s) + "\n")
 
 
-def new_signal_record(result):
+def new_signal_record(result, tier):
     entry_price = result["price"]
     direction = result["direction"]
-    atr_val = result.get("atr")
-
-    if USE_ATR_TARGETS and atr_val:
-        sizing_method = "atr"
+    atr_val = result["atr"]
+    if atr_val:
         if direction == "bull":
             target_price = entry_price + atr_val * TARGET_ATR_MULT
             stop_price = entry_price - atr_val * STOP_ATR_MULT
@@ -392,55 +359,26 @@ def new_signal_record(result):
             target_price = entry_price - atr_val * TARGET_ATR_MULT
             stop_price = entry_price + atr_val * STOP_ATR_MULT
     else:
-        sizing_method = "fixed_pct"
-        if direction == "bull":
-            target_price = entry_price * (1 + TARGET_PCT / 100)
-            stop_price = entry_price * (1 - STOP_PCT / 100)
-        else:
-            target_price = entry_price * (1 - TARGET_PCT / 100)
-            stop_price = entry_price * (1 + STOP_PCT / 100)
-
-    target_pct = abs(target_price - entry_price) / entry_price * 100
-    stop_pct = abs(stop_price - entry_price) / entry_price * 100
+        pct = 1.5 / 100
+        target_price = entry_price * (1 + pct) if direction == "bull" else entry_price * (1 - pct)
+        stop_price = entry_price * (1 - pct) if direction == "bull" else entry_price * (1 + pct)
 
     return {
         "id": f"{result['symbol']}-{result['last_closed_candle_time']}-{direction}",
-        "symbol": result["symbol"],
-        "direction": direction,
+        "symbol": result["symbol"], "direction": direction, "tier": tier,
         "signal_candle_time": result["last_closed_candle_time"],
-        "entry_price": entry_price,
-        "target_price": target_price,
-        "stop_price": stop_price,
-        "target_pct": round(target_pct, 3),
-        "stop_pct": round(stop_pct, 3),
-        "sizing_method": sizing_method,
-        "atr_at_signal": atr_val,
-        "horizon_candles": HORIZON_CANDLES,
-        "status": "open",
-        "outcome": None,
-        "exit_price": None,
-        "pct_result": None,
-        "candles_elapsed": 0,
+        "entry_price": entry_price, "target_price": target_price, "stop_price": stop_price,
+        "horizon_candles": HORIZON_CANDLES, "status": "open", "outcome": None,
+        "exit_price": None, "pct_result": None, "candles_elapsed": 0,
     }
 
 
 def resolve_open_signals(open_signals_for_symbol, closed_candles):
-    """
-    Revisa cada señal abierta contra las velas cerradas que llegaron
-    DESPUÉS de que se generó la señal. Usa el high/low de cada vela para
-    ver si tocó el target o el stop primero.
-
-    Limitación honesta: si target y stop se tocan dentro de la MISMA vela,
-    no hay forma de saber cuál pasó primero con datos de vela cerrada —
-    en ese caso, por seguridad, se asume que el stop se tocó primero
-    (supuesto conservador, evita inflar artificialmente la tasa de éxito).
-    """
     resolved_now = []
     for signal in open_signals_for_symbol:
         after = [c for c in closed_candles if c["time"] > signal["signal_candle_time"]]
         if not after:
             continue
-
         for i, c in enumerate(after, start=1):
             if signal["direction"] == "bull":
                 hit_target = c["high"] >= signal["target_price"]
@@ -470,45 +408,46 @@ def resolve_open_signals(open_signals_for_symbol, closed_candles):
                 break
         else:
             signal["candles_elapsed"] = len(after)
-
     return resolved_now
+
+
+def format_resolution_message(signal):
+    label = signal["symbol"].replace("USDT", "")
+    icon = {"target_hit": "✅", "stop_hit": "❌", "timeout": "⏱"}[signal["outcome"]]
+    outcome_txt = {"target_hit": "TARGET alcanzado", "stop_hit": "STOP alcanzado", "timeout": "sin definir (timeout)"}[signal["outcome"]]
+    return (
+        f"{icon} *{label}* ({signal['direction']}, tier {signal['tier']}) — {outcome_txt}\n"
+        f"Entrada: ${signal['entry_price']:,.2f} → Salida: ${signal['exit_price']:,.2f}\n"
+        f"Resultado: {signal['pct_result']:+.2f}%"
+    )
 
 
 def compute_stats(signals):
     closed = [s for s in signals if s["status"] == "closed"]
     if not closed:
         return None
-    wins = [s for s in closed if s["outcome"] == "target_hit"]
-    losses = [s for s in closed if s["outcome"] == "stop_hit"]
-    timeouts = [s for s in closed if s["outcome"] == "timeout"]
-    decided = wins + losses
+    decided = [s for s in closed if s["outcome"] in ("target_hit", "stop_hit")]
+    wins = [s for s in decided if s["outcome"] == "target_hit"]
     win_rate = (len(wins) / len(decided) * 100) if decided else None
     avg_pct = sum(s["pct_result"] for s in closed) / len(closed)
-    return {
-        "total_closed": len(closed),
-        "wins": len(wins),
-        "losses": len(losses),
-        "timeouts": len(timeouts),
-        "win_rate_pct": win_rate,
-        "avg_pct_result": avg_pct,
-        "open_count": len([s for s in signals if s["status"] == "open"]),
-    }
+    return {"total_closed": len(closed), "win_rate_pct": win_rate, "avg_pct_result": avg_pct,
+            "open_count": len([s for s in signals if s["status"] == "open"])}
 
 
-def format_resolution_message(signal):
-    label = signal["symbol"].replace("USDT", "")
-    outcome_icon = {"target_hit": "✅", "stop_hit": "❌", "timeout": "⏱"}[signal["outcome"]]
-    outcome_txt = {
-        "target_hit": "TARGET alcanzado",
-        "stop_hit": "STOP alcanzado",
-        "timeout": "sin definir a tiempo (timeout)",
-    }[signal["outcome"]]
-    return (
-        f"{outcome_icon} *{label}* ({signal['direction']}) — {outcome_txt}\n"
-        f"Entrada: ${signal['entry_price']:,.2f} → Salida: ${signal['exit_price']:,.2f}\n"
-        f"Resultado: {signal['pct_result']:+.2f}%\n"
-        f"_Registro de fiabilidad, no una operación real._"
-    )
+# ==================== State y resumen diario ====================
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
 
 def maybe_send_daily_summary(state, signals):
@@ -517,36 +456,22 @@ def maybe_send_daily_summary(state, signals):
     now = time.time()
     if last_ts is not None and (now - last_ts) < SUMMARY_INTERVAL_HOURS * 3600:
         return
-
     stats = compute_stats(signals)
-    open_count = len([s for s in signals if s["status"] == "open"])
-    total_signals = len(signals)
-
     if stats:
-        win_rate_txt = f"{stats['win_rate_pct']:.1f}%" if stats["win_rate_pct"] is not None else "—"
+        wr_txt = f"{stats['win_rate_pct']:.1f}%" if stats["win_rate_pct"] is not None else "—"
         body = (
             f"📊 *Resumen diario — Crypto Signal Monitor*\n\n"
-            f"Bot activo, corriendo cada 5 min.\n"
-            f"Señales totales generadas: {total_signals}\n"
-            f"Abiertas ahora: {open_count}\n"
-            f"Cerradas: {stats['total_closed']} "
-            f"(✅ {stats['wins']} · ❌ {stats['losses']} · ⏱ {stats['timeouts']})\n"
-            f"Win rate: {win_rate_txt}\n"
-            f"Retorno promedio por señal: {stats['avg_pct_result']:+.2f}%\n\n"
-            f"_Solo watch-only. Esto no es una recomendación de inversión._"
+            f"Bot activo. Señales cerradas: {stats['total_closed']} · abiertas: {stats['open_count']}\n"
+            f"Win rate: {wr_txt} · retorno promedio: {stats['avg_pct_result']:+.2f}%\n\n"
+            f"_Watch-only. No es consejo financiero._"
         )
     else:
-        body = (
-            f"📊 *Resumen diario — Crypto Signal Monitor*\n\n"
-            f"Bot activo, corriendo cada 5 min. Todavía no se generó "
-            f"ninguna señal (los filtros son exigentes a propósito) — "
-            f"nada para reportar por ahora."
-        )
-
+        body = "📊 *Resumen diario — Crypto Signal Monitor*\n\nBot activo. Todavía sin señales cerradas."
     send_telegram(body)
     meta["last_summary_ts"] = now
 
 
+# ==================== Main ====================
 def main():
     state = load_state()
     signals = load_signals()
@@ -555,75 +480,74 @@ def main():
     for symbol in SYMBOLS:
         symbol = symbol.strip()
         try:
-            candles = fetch_klines(symbol, INTERVAL)
+            candles_15m = fetch_klines(symbol, REVERSAL_INTERVAL)
+            candles_4h = fetch_klines(symbol, TREND_INTERVAL)
+            candles_1d = fetch_klines(symbol, DAILY_INTERVAL) if USE_DAILY_CONFIRMATION else []
         except Exception as e:
             print(f"[ERROR] {symbol}: no se pudo obtener datos ({e})")
             continue
 
-        closed_candles = [c for c in candles if c["is_closed"]]
-        min_needed = max(RSI_PERIOD, MA_SLOW, BB_PERIOD, ATR_PERIOD) + 1
-        if len(closed_candles) < min_needed:
-            print(f"[WARN] {symbol}: no hay suficientes velas cerradas todavía, se salta este ciclo.")
+        if len(closed_only(candles_15m)) < max(RSI_PERIOD, BB_PERIOD) + 1:
+            print(f"[WARN] {symbol}: pocas velas de 15m todavía, se salta.")
+            continue
+        if len(closed_only(candles_4h)) < max(MA_SLOW, ATR_PERIOD) + 1:
+            print(f"[WARN] {symbol}: pocas velas de 4h todavía, se salta.")
             continue
 
+        # --- Sistema 2: estado de tendencia ---
+        trend = evaluate_trend(symbol, candles_4h, candles_1d)
+        symbol_state = state.get(symbol, {})
+        prev_trend_status = symbol_state.get("trend_status")
+        if prev_trend_status is not None and trend["status"] != prev_trend_status:
+            send_telegram(format_trend_change(symbol, prev_trend_status, trend["status"]))
+        symbol_state["trend_status"] = trend["status"]
+
+        # --- Sistema 1: zona de giro ---
+        reversal = evaluate_reversal(symbol, candles_15m)
+
+        # --- Resolver señales de giro ya abiertas ---
         open_for_symbol = [s for s in signals if s["symbol"] == symbol and s["status"] == "open"]
-        resolved = resolve_open_signals(open_for_symbol, closed_candles)
+        resolved = resolve_open_signals(open_for_symbol, closed_only(candles_15m))
         if resolved and NOTIFY_ON_RESOLUTION:
             for s in resolved:
                 send_telegram(format_resolution_message(s))
 
-        result = evaluate(symbol, candles)
-
-        symbol_state = state.get(symbol, {})
-        prev_direction = symbol_state.get("direction")
-        prev_candle_time = symbol_state.get("candle_time")
-        same_candle = prev_candle_time == result["last_closed_candle_time"]
-
-        should_alert = (
-            result["direction"]
-            and not (result["direction"] == prev_direction and same_candle)
-        )
+        # --- Nueva alerta de giro, con el tier según la tendencia vigente ---
+        prev_direction = symbol_state.get("reversal_direction")
+        prev_candle_time = symbol_state.get("reversal_candle_time")
+        same_candle = prev_candle_time == reversal["last_closed_candle_time"]
+        should_alert = reversal["direction"] and not (reversal["direction"] == prev_direction and same_candle)
 
         if should_alert:
-            send_telegram(format_alert(result))
-            signals.append(new_signal_record(result))
+            if trend["status"] == "alcista" and reversal["direction"] == "bull":
+                tier = "fuerte"
+            elif trend["status"] == "bajista" and reversal["direction"] == "bear":
+                tier = "fuerte"
+            elif trend["status"] == "neutral":
+                tier = "moderada"
+            else:
+                tier = "contraria"
+
+            send_telegram(format_reversal_alert(reversal, trend, tier))
+            signals.append(new_signal_record(reversal, tier))
             any_sent = True
 
-        state[symbol] = {
-            "direction": result["direction"],
-            "candle_time": result["last_closed_candle_time"],
-        }
+        symbol_state["reversal_direction"] = reversal["direction"]
+        symbol_state["reversal_candle_time"] = reversal["last_closed_candle_time"]
+        state[symbol] = symbol_state
 
         print(
-            f"{symbol}: price={result['price']:.2f} rsi={result['rsi']} "
-            f"cross={result['cross']} mom={result['momentum']:.2f}% "
-            f"bb={result['bb_kind']} atr={result['atr']} "
-            f"vol_ratio={result['volume_ratio']:.2f} "
-            f"base={result['base_direction']} htf_trend={result['htf_trend']} "
-            f"final={result['direction']} "
-            f"blocked_by={result['blocked_by'] or '-'} "
-            f"resolved_this_run={len(resolved)}"
+            f"{symbol}: price={reversal['price']:.2f} rsi={reversal['rsi']} "
+            f"vol_ratio={reversal['vol_ratio']:.2f} reversal={reversal['direction']} "
+            f"| trend={trend['status']} (cross={trend['cross_kind']}, mom={trend['momentum_kind']}, "
+            f"daily={trend['daily_kind']}) | resolved_this_run={len(resolved)}"
         )
 
     maybe_send_daily_summary(state, signals)
-
     save_state(state)
     save_signals(signals)
-
-    stats = compute_stats(signals)
-    if stats:
-        print(
-            f"[STATS] cerradas={stats['total_closed']} "
-            f"wins={stats['wins']} losses={stats['losses']} timeouts={stats['timeouts']} "
-            f"win_rate={stats['win_rate_pct']:.1f}%" if stats['win_rate_pct'] is not None
-            else f"[STATS] cerradas={stats['total_closed']} sin datos suficientes para win rate"
-        )
-        print(f"[STATS] retorno promedio por señal: {stats['avg_pct_result']:+.2f}% | abiertas: {stats['open_count']}")
-    else:
-        print("[STATS] todavía no hay señales cerradas para calcular fiabilidad.")
-
     if not any_sent:
-        print("Sin señales nuevas en este ciclo.")
+        print("Sin alertas de giro nuevas en este ciclo.")
 
 
 if __name__ == "__main__":
