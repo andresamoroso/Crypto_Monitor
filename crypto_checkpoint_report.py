@@ -114,6 +114,18 @@ def main():
             lines.append(f"• {direction}: win rate {wr_txt}, retorno prom. {s['avg_pct']:+.2f}% (n={s['n']})")
         lines.append("")
 
+    by_tier = group_stats(closed, lambda s: s.get("tier", "sin_tier"))
+    if by_tier:
+        tier_labels = {"fuerte": "✅ Fuerte (giro + tendencia coinciden)",
+                       "moderada": "➖ Moderada (tendencia neutral)",
+                       "contraria": "⚠️ Contraria (giro va contra la tendencia)"}
+        lines.append("*Por tier (esta es la comparación clave del rediseño):*")
+        for tier, s in sorted(by_tier.items(), key=lambda kv: -kv[1]["n"]):
+            wr_txt = f"{s['win_rate']:.0f}%" if s["win_rate"] is not None else "—"
+            label = tier_labels.get(tier, tier)
+            lines.append(f"• {label}: win rate {wr_txt}, retorno prom. {s['avg_pct']:+.2f}% (n={s['n']})")
+        lines.append("")
+
     # ---- Señales de alerta (heurísticas simples, no un juicio definitivo) ----
     flags = []
     if overall_wr is not None and overall_wr < 40 and decided_n >= MIN_SAMPLES_FOR_FLAGS:
@@ -134,6 +146,16 @@ def main():
                 f"⚠️ Las señales '{direction}' vienen con win rate bajo "
                 f"({s['win_rate']:.0f}%, n={s['n']}) — podría valer la pena "
                 f"revisar si ese lado necesita un filtro extra."
+            )
+    if "fuerte" in by_tier and "contraria" in by_tier:
+        fuerte_wr = by_tier["fuerte"]["win_rate"]
+        contraria_wr = by_tier["contraria"]["win_rate"]
+        if fuerte_wr is not None and contraria_wr is not None and contraria_wr >= fuerte_wr:
+            flags.append(
+                f"⚠️ Las señales 'contraria' ({contraria_wr:.0f}%) están "
+                f"acertando igual o mejor que las 'fuerte' ({fuerte_wr:.0f}%) "
+                f"— esto sugiere que la tendencia mayor NO está aportando la "
+                f"confirmación esperada. Vale la pena revisarlo juntos."
             )
 
     if flags:
