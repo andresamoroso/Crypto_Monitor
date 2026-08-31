@@ -1,0 +1,1 @@
+{"id": "ETHUSDT-1788133500000-bull", "symbol": "ETHUSDT", "direction": "bull", "tier": "moderada", "signal_candle_time": 1788133500000, "entry_price": 2085.98, "target_price": 2104.964167750082, "stop_price": 2073.323888166612, "horizon_candles": 4, "status": "open", "outcome": null, "exit_price": null, "pct_result": null, "candles_elapsed": 0}
